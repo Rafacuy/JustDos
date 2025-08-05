@@ -12,7 +12,7 @@
         <img alt="JustDos last commit" src="https://img.shields.io/github/last-commit/Rafacuy/JustDos/main?color=green&style=for-the-badge">
     </a>
     <a href="#">
-        <img alt="JustDos License" src="https://img.shields.io/github/license/Rafacuy/JustDos?color=orange&style=for-the-badge">
+        <img alt="JustDos License" src="https://img.shields.io/github/license/Rafacuy/JustDos??color=orange&style=for-the-badge">
     </a>
     <a href="https://github.com/Rafacuy/JustDos/issues">
         <img alt="MatrixTM issues" src="https://img.shields.io/github/issues/Rafacuy/JustDos?color=purple&style=for-the-badge">
