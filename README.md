@@ -9,7 +9,7 @@
 
 <p align="center">
     <a href="#">
-        <img alt="JustDos last commit" src="https://img.shields.io/github/last-commit/RafacuyM/JustDos/main?color=green&style=for-the-badge">
+        <img alt="JustDos last commit" src="https://img.shields.io/github/last-commit/Rafacuy/JustDos/main?color=green&style=for-the-badge">
     </a>
     <a href="#">
         <img alt="JustDos License" src="https://img.shields.io/github/license/Rafacuy/JustDos?color=orange&style=for-the-badge">
