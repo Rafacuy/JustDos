@@ -13,30 +13,20 @@ from typing import Optional, Dict, List, Any
 
 # --- Default Configuration ---
 DEFAULT_CONFIG = {
-    "LATENCY_MULTIPLIER": 3.0,      # Multiplier for avg latency to determine a "slow" path
-    "MIN_LATENCY_THRESHOLD": 1.5,   # Minimum threshold for slowness, in seconds
-    "BLOCK_COOLDOWN_S": 60,         # Base cooldown replaced by dynamic cooldown
-    "MAX_CONSECUTIVE_FAILURES": 3,  # Legacy metric, retained but less critical with health scores
-    "LATENCY_HISTORY_SIZE": 100,    # How many recent latency values to average
-    "HEALTH_THRESHOLD": 0.4,        # Below this, a path enters cooldown
-    "EMERGENCY_HEALTH_THRESHOLD": 0.3,  # Average health below this triggers Emergency Mode
-    "MIN_HEALTH_THRESHOLD": 0.5,    # Minimum health to use a path in Emergency Mode
-    "BASE_COOLDOWN": 120,           # Base cooldown in seconds for dynamic calculation
+    "LATENCY_HISTORY_SIZE": 100,
+    "HEALTH_THRESHOLD": 0.4,
+    "EMERGENCY_HEALTH_THRESHOLD": 0.3,
+    "MIN_HEALTH_THRESHOLD": 0.5,
+    "BASE_COOLDOWN": 60,
+    "STALE_PATH_TIMEOUT": 3600,  # 1 hour
+    "CLEANUP_INTERVAL": 300,     # 5 minutes
+    "HIGH_LATENCY_MULTIPLIER": 2.0,
+    "MIN_HIGH_LATENCY": 1.0,     # 1 second
 }
 
 class StrategyPlanner:
     """
     Manages and dynamically adapts the attack strategy based on real-time feedback.
-
-    The "Adaptive Ninja" with HealthScore-based path management, smart cooldowns,
-    and dynamic attack modes (Emergency vs Aggressive).
-
-    Attributes:
-        config (Dict[str, Any]): Configuration settings for the planner
-        path_states (Dict[str, Dict]): Stores the dynamic state of each attack path
-        latency_history (List[float]): A list of recent successful request latencies
-        avg_latency (float): The current average latency of successful requests
-        lock (asyncio.Lock): A lock for thread-safe operations
     """
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         """Initializes the StrategyPlanner with default or custom config."""
@@ -44,113 +34,115 @@ class StrategyPlanner:
         self.path_states: Dict[str, Dict[str, Any]] = {}
         self.latency_history: List[float] = []
         self.avg_latency: float = 0.0
+        self.total_health: float = 0.0
+        self.path_count: int = 0
+        self.last_cleanup: float = 0
         self.lock = asyncio.Lock()
 
-    async def _get_or_create_path_state(self, path: str) -> Dict[str, Any]:
-        """Retrieves or initializes the state for a given path with a health score."""
+    def _get_or_create_path_state(self, path: str) -> Dict[str, Any]:
+        """Retrieves or initializes the state for a given path."""
         if path not in self.path_states:
             self.path_states[path] = {
-                "health_score": 1.0,  # Starts healthy
-                "last_seen": 0,
-                "last_failure": 0,
-                "consecutive_failures": 0,
+                "health_score": 1.0,
+                "last_seen": time.monotonic(),
+                "rest_until": 0,
             }
+            self.total_health += 1.0
+            self.path_count += 1
         return self.path_states[path]
 
-    async def _update_latency(self, latency: float):
-        """Updates the running average latency for successful requests."""
+    def _update_latency(self, latency: float):
+        """Updates the running average latency."""
         self.latency_history.append(latency)
         if len(self.latency_history) > self.config["LATENCY_HISTORY_SIZE"]:
             self.latency_history.pop(0)
         if self.latency_history:
             self.avg_latency = sum(self.latency_history) / len(self.latency_history)
 
+    def _high_latency_threshold(self) -> float:
+        """Calculates the dynamic threshold for high latency."""
+        return max(self.config["MIN_HIGH_LATENCY"], self.avg_latency * self.config["HIGH_LATENCY_MULTIPLIER"])
+
     async def analyze(self, path: str, status_code: Optional[int], latency: float):
         """
-        Analyzes a request's result, updates the path's health score, and manages cooldowns.
-
-        Args:
-            path (str): The resource path that was requested
-            status_code (Optional[int]): The HTTP status code of the response
-            latency (float): The request latency in seconds
+        Analyzes a request's result and updates the path's health score.
         """
+        current_time = time.monotonic()
         async with self.lock:
-            state = await self._get_or_create_path_state(path)
-            state["last_seen"] = time.monotonic()
+            state = self._get_or_create_path_state(path)
+            old_health = state["health_score"]
+            state["last_seen"] = current_time
 
             is_successful = status_code is not None and 200 <= status_code < 300
-            is_blocked_by_waf = status_code in {403, 429}
+            is_blocked = status_code in {403, 429}
             is_server_error = status_code is not None and 500 <= status_code < 600
-            is_connection_failure = status_code is None
-            is_high_latency = latency > 3.0  # Fixed threshold of 3s as per team example
+            is_high_latency = latency > self._high_latency_threshold()
 
-            if is_successful:
-                state["health_score"] += 0.1
-                if is_high_latency:
-                    state["health_score"] -= 0.3
-                state["consecutive_failures"] = 0
-                await self._update_latency(latency)
+            if is_successful and not is_high_latency:
+                state["health_score"] = min(1.0, state["health_score"] + 0.05)
+                self._update_latency(latency)
             else:
-                state["consecutive_failures"] += 1
-                state["last_failure"] = time.monotonic()
-                if is_blocked_by_waf:
-                    state["health_score"] -= 0.5
-                elif is_server_error or is_connection_failure:
+                if is_blocked:
                     state["health_score"] -= 0.4
+                elif is_server_error:
+                    state["health_score"] -= 0.2
+                else:
+                    state["health_score"] -= 0.1
+            
+            state["health_score"] = max(0.0, state["health_score"])
 
-            # Clamp health_score between 0 and 1
-            state["health_score"] = max(0.0, min(1.0, state["health_score"]))
+            new_health = state["health_score"]
+            self.total_health += new_health - old_health
 
-            # Smart Cooldown Timer: Enter cooldown if health_score falls below threshold
             if state["health_score"] < self.config["HEALTH_THRESHOLD"]:
                 cooldown_period = self.config["BASE_COOLDOWN"] * (1 - state["health_score"])
-                state["rest_until"] = time.monotonic() + cooldown_period
+                state["rest_until"] = current_time + cooldown_period
+
+            # Cleanup stale paths if it's time
+            if current_time - self.last_cleanup > self.config["CLEANUP_INTERVAL"]:
+                to_remove = [
+                    p for p, s in self.path_states.items()
+                    if current_time - s["last_seen"] > self.config["STALE_PATH_TIMEOUT"]
+                ]
+                for p in to_remove:
+                    self.total_health -= self.path_states[p]["health_score"]
+                    del self.path_states[p]
+                    self.path_count -= 1
+                self.last_cleanup = current_time
 
     async def get_average_health(self) -> float:
         """Calculates the average health score across all paths."""
         async with self.lock:
-            if not self.path_states:
+            if self.path_count == 0:
                 return 1.0
-            total_health = sum(state["health_score"] for state in self.path_states.values())
-            return total_health / len(self.path_states)
+            return self.total_health / self.path_count
 
     async def is_path_dangerous(self, path: str) -> bool:
-        """
-        Determines if a path should be avoided based on its health score and attack mode.
-
-        Args:
-            path (str): The path to check
-
-        Returns:
-            bool: True if the path should be avoided, False otherwise
-        """
+        """Determines if a path should be avoided."""
         async with self.lock:
-            state = await self._get_or_create_path_state(path)
-            if "rest_until" in state and time.monotonic() < state["rest_until"]:
+            state = self._get_or_create_path_state(path)
+            if time.monotonic() < state.get("rest_until", 0):
                 return True
-            avg_health = await self.get_average_health()
-            if avg_health < self.config["EMERGENCY_HEALTH_THRESHOLD"] and state["health_score"] < self.config["MIN_HEALTH_THRESHOLD"]:
-                return True
+            
+            avg_health = self.total_health / self.path_count if self.path_count > 0 else 1.0
+            if avg_health < self.config["EMERGENCY_HEALTH_THRESHOLD"]:
+                return state["health_score"] < self.config["MIN_HEALTH_THRESHOLD"]
+            
             return False
 
     async def summary(self) -> Dict[str, Any]:
-        """
-        Provides a summary of the planner's current state, including attack mode.
-
-        Returns:
-            A dictionary with current stats
-        """
+        """Provides a summary of the planner's current state."""
         async with self.lock:
             blocked_paths = [
                 path for path, state in self.path_states.items()
-                if "rest_until" in state and time.monotonic() < state["rest_until"]
+                if time.monotonic() < state.get("rest_until", 0)
             ]
-            avg_health = await self.get_average_health()
-            mode = "Emergency Mode" if avg_health < self.config["EMERGENCY_HEALTH_THRESHOLD"] else "Aggressive Mode"
+            avg_health = self.total_health / self.path_count if self.path_count > 0 else 1.0
+            mode = "Emergency" if avg_health < self.config["EMERGENCY_HEALTH_THRESHOLD"] else "Aggressive"
             return {
                 "mode": mode,
                 "average_health": f"{avg_health:.2f}",
-                "blocked_paths": sorted(blocked_paths),
-                "active_paths_count": len(self.path_states) - len(blocked_paths),
+                "blocked_paths_count": len(blocked_paths),
+                "active_paths_count": self.path_count - len(blocked_paths),
                 "avg_latency_ms": f"{self.avg_latency * 1000:.2f}" if self.avg_latency > 0 else "N/A",
             }
